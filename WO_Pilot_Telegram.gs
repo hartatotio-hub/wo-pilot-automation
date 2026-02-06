@@ -63,7 +63,8 @@ function telegramAnswerCallbackQuery_(token, callbackQueryId, text, showAlert) {
 }
 
 function telegramGetUpdates_(token, offset) {
-  const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${encodeURIComponent(String(offset || 0))}`;
+  const allowed = encodeURIComponent(JSON.stringify(["message", "edited_message", "callback_query"]));
+  const url = `https://api.telegram.org/bot${token}/getUpdates?offset=${encodeURIComponent(String(offset || 0))}&timeout=20&allowed_updates=${allowed}`;
   const res = UrlFetchApp.fetch(url, { method: "get", muteHttpExceptions: true });
   return safeParseJson_(res.getContentText());
 }
