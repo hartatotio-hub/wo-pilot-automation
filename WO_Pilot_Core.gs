@@ -92,6 +92,8 @@ function pollTelegramUpdates() {
 
       // 1) CALLBACK QUERIES (inline buttons)
       if (upd.callback_query) {
+        const cbData = String((upd.callback_query && upd.callback_query.data) || "");
+        logInfo_(`[callback_query] received update_id=${upd.update_id} data=${cbData}`);
         handleCallbackQuery_(shWo, upd.callback_query);
         continue;
       }
@@ -252,6 +254,7 @@ function processWoRow_(shWo, rowIndex, meta) {
   const tg = telegramSendMessage_(cfg.TELEGRAM_BOT_TOKEN, coordId, msgText, { replyMarkup: kb, disablePreview: true });
   if (tg && tg.ok && tg.result && tg.result.message_id) {
     row[coordMsgCol] = tg.result.message_id;
+    setCellIfExists_(headerMap, row, "COORD_MESSAGE_ID", tg.result.message_id);
     row[coordSentCol] = new Date();
     row[coordResCol] = "OK";
   } else {
@@ -293,6 +296,9 @@ function handleCallbackQuery_(shWo, cb) {
   const woId = parts[2] || "";
 
   const cbId = cb.id;
+
+  logInfo_(`[callback_query] parsed kind=${kind} action=${action} woId=${woId}`);
+
   const chatId = cb.message && cb.message.chat ? String(cb.message.chat.id) : "";
   const messageId = cb.message ? cb.message.message_id : null;
 
@@ -330,17 +336,48 @@ function handleCallbackQuery_(shWo, cb) {
         const text = buildCoordinatorStatusText_(shWo, woId, "REJECTED", by);
         const kb = tgInlineKeyboard_([
           [
-            { text: "🎯 Offer ke Group", callback_data: `C|O|${woId}` },
-            { text: "🔧 Manual Pilih Team", callback_data: `C|M|${woId}` }
+            { text: "🔧 Change Team", callback_data: `C|RCM|${woId}` },
+            { text: "🎯 Offer to Group", callback_data: `C|RCO|${woId}` }
           ],
           [
-            { text: "🚫 Cancel", callback_data: `C|X|${woId}` },
+            { text: "🚫 Cancel WO", callback_data: `C|RCX|${woId}` },
             { text: "⬅️ Back", callback_data: `C|B|${woId}` }
           ]
         ]);
         telegramEditMessageText_(token, chatId, messageId, text, { replyMarkup: kb, disablePreview: true });
       }
+      setRejectReason_(shWo, woId, `Rejected by ${by}`);
       setWoApprovalStatus_(shWo, woId, "REJECTED", by);
+      return;
+    }
+
+    if (action === "RCM") {
+      setRejectReason_(shWo, woId, `Change team requested by ${by}`);
+      telegramAnswerCallbackQuery_(token, cbId, "Ganti team via manual.", false);
+      const ok = startManualPick_(shWo, woId, by, chatId, messageId);
+      if (!ok) telegramAnswerCallbackQuery_(token, cbId, "Manual gagal (WO tidak ditemukan).", true);
+      return;
+    }
+
+    if (action === "RCO") {
+      setRejectReason_(shWo, woId, `Offer requested by ${by}`);
+      telegramAnswerCallbackQuery_(token, cbId, "Offer ke group diproses.", false);
+      const ok = startOfferToGroup_(shWo, woId, by);
+      if (messageId) {
+        const text = buildCoordinatorStatusText_(shWo, woId, ok ? "OFFERING" : "OFFER_FAILED", by);
+        telegramEditMessageText_(token, chatId, messageId, text, { disablePreview: true });
+      }
+      return;
+    }
+
+    if (action === "RCX") {
+      setRejectReason_(shWo, woId, `Canceled after reject by ${by}`);
+      telegramAnswerCallbackQuery_(token, cbId, "WO dibatalkan.", false);
+      cancelWo_(shWo, woId, by);
+      if (messageId) {
+        const text = buildCoordinatorStatusText_(shWo, woId, "CANCELED", by);
+        telegramEditMessageText_(token, chatId, messageId, text, { replyMarkup: null, disablePreview: true });
+      }
       return;
     }
 
@@ -466,9 +503,25 @@ function approveWo_(shWo, woId, by) {
   };
 
   if (!assignment.assignedTo || assignment.assignedTo === "-") {
-    values[idx][syncCol] = "Approve blocked: assigned team is empty. Use Manual/Offer.";
-    writeTable_(shWo, values);
-    return false;
+    const allTeams = getAllTeams_(true).map(t => t.team).filter(Boolean);
+    if (allTeams.length > 0) {
+      assignment.assignedTo = allTeams[0];
+      assignment.supportTeams = [];
+      values[idx][assignedCol] = assignment.assignedTo;
+      values[idx][supportCol] = "-";
+      values[idx][syncCol] = "Situasi tidak normal: fallback dispatch tanpa kandidat TERSEDIA/restriksi.";
+
+      const coordId = String(cfg.TELEGRAM_CHAT_COORD_ID || "").trim();
+      if (coordId) {
+        telegramSendMessage_(cfg.TELEGRAM_BOT_TOKEN, coordId,
+          `⚠️ Situasi tidak normal WO ${woId}. Auto-assign tidak menemukan kandidat, bot fallback ke ${assignment.assignedTo}. Gunakan Manual jika perlu override.`,
+          { disablePreview: true });
+      }
+    } else {
+      values[idx][syncCol] = "Approve blocked: assigned team is empty. Use Manual/Offer.";
+      writeTable_(shWo, values);
+      return false;
+    }
   }
 
   // Dispatch to team group
@@ -477,13 +530,17 @@ function approveWo_(shWo, woId, by) {
 
   const msgText = buildTelegramMessage_(woId, row, headerMap, assignment);
   const tg = telegramSendMessage_(cfg.TELEGRAM_BOT_TOKEN, teamChatId, msgText, { disablePreview: false });
+  logInfo_(`[dispatch] woId=${woId} send result=${safeJson_(tg)}`);
 
   if (tg && tg.ok && tg.result && tg.result.message_id) {
     values[idx][teamMsgCol] = tg.result.message_id;
+    setCellIfExists_(headerMap, values[idx], "TEAM_MESSAGE_ID", tg.result.message_id);
     if (tgMsgLegacyCol !== null) values[idx][tgMsgLegacyCol] = tg.result.message_id;
     values[idx][syncCol] = "Dispatched to team group";
+    logInfo_(`[dispatch] success woId=${woId} message_id=${tg.result.message_id}`);
   } else {
     values[idx][syncCol] = "Telegram Error (Team): " + safeJson_(tg);
+    logError_(`[dispatch] failed woId=${woId} result=${safeJson_(tg)}`);
     writeTable_(shWo, values);
     return false;
   }
@@ -533,6 +590,16 @@ function setWoApprovalStatus_(shWo, woId, status, by) {
   values[idx][approvalCol] = String(status || "");
   values[idx][lastUpCol] = new Date();
   values[idx][lastByCol] = by;
+  writeTable_(shWo, values);
+}
+
+function setRejectReason_(shWo, woId, reason) {
+  const ctx = getWoContext_(shWo, woId);
+  if (!ctx) return;
+  const { headerMap, values, idx } = ctx;
+  setCellIfExists_(headerMap, values[idx], "REJECT_REASON", String(reason || ""));
+  values[idx][mustCol_(headerMap, "LAST_UPDATE_AT")] = new Date();
+  values[idx][mustCol_(headerMap, "LAST_UPDATE_BY")] = "SYSTEM";
   writeTable_(shWo, values);
 }
 
@@ -599,6 +666,7 @@ function startOfferToGroup_(shWo, woId, by) {
   setCellIfExists_(headerMap, values[idx], "PICK_REQUIRED_TEAMS", requiredTeams);
   setCellIfExists_(headerMap, values[idx], "PICK_SELECTED_TEAMS", "");
   setCellIfExists_(headerMap, values[idx], "OFFER_STAGE", "ASSIGNED");
+  setCellIfExists_(headerMap, values[idx], "OFFER_STATE_JSON", JSON.stringify({ stage: "ASSIGNED", selected: [], requiredTeams }));
   values[idx][approvalCol] = "OFFERING";
   values[idx][syncCol] = "Offering to group";
 
@@ -629,6 +697,7 @@ function handleOfferPick_(shWo, woId, teamCode, by, cb, cbId) {
 
   selected.push(teamCode);
   setCellIfExists_(headerMap, values[idx], "PICK_SELECTED_TEAMS", selected.join(", "));
+  setCellIfExists_(headerMap, values[idx], "OFFER_STATE_JSON", JSON.stringify({ stage: String(getCell_(headerMap, values[idx], "OFFER_STAGE") || "ASSIGNED"), selected, requiredTeams }));
 
   // Close this offer message keyboard
   try {
@@ -742,6 +811,7 @@ function startManualPick_(shWo, woId, by, coordChatId, coordMsgId) {
   setCellIfExists_(headerMap, values[idx], "PICK_REQUIRED_TEAMS", requiredTeams);
   setCellIfExists_(headerMap, values[idx], "MANUAL_STAGE", "ASSIGNED");
   setCellIfExists_(headerMap, values[idx], "MANUAL_SELECTED_TEAMS", "");
+  setCellIfExists_(headerMap, values[idx], "MANUAL_STATE_JSON", JSON.stringify({ stage: "ASSIGNED", selected: [], requiredTeams }));
 
   values[idx][mustCol_(headerMap, "APPROVAL_STATUS")] = "MANUAL";
 
@@ -785,6 +855,7 @@ function handleManualPickClick_(shWo, woId, teamCode, by, coordChatId, coordMsgI
 
   selected.push(teamCode);
   setCellIfExists_(headerMap, values[idx], "MANUAL_SELECTED_TEAMS", selected.join(", "));
+  setCellIfExists_(headerMap, values[idx], "MANUAL_STATE_JSON", JSON.stringify({ stage, selected, requiredTeams }));
   writeTable_(shWo, values);
 
   // Determine next step
@@ -1087,6 +1158,7 @@ function handleTeamDoneAlbum_(shWo, woId, albumMsgs, captionOrText, by, msgObj) 
   const mergedIds = prevIds ? (prevIds + "," + fileIds.join(",")) : fileIds.join(",");
   setCellIfExists_(headerMap, row, "DONE_PHOTO_FILE_IDS", mergedIds);
   setCellIfExists_(headerMap, row, "DONE_PHOTO_COUNT", (mergedIds ? mergedIds.split(",").filter(Boolean).length : fileIds.length));
+  setCellIfExists_(headerMap, row, "DONE_EVIDENCE_COUNT", (mergedIds ? mergedIds.split(",").filter(Boolean).length : fileIds.length));
 
   // Calendar update
   try {
@@ -1114,6 +1186,9 @@ function handleTeamDoneAlbum_(shWo, woId, albumMsgs, captionOrText, by, msgObj) 
     const reportText = buildRealisasiReport_(woId, row, headerMap, assignment, snText, by, wasTerminal);
     telegramSendMessage_(cfg.TELEGRAM_BOT_TOKEN, realChat, reportText, { disablePreview: true });
     telegramSendMediaGroupChunked_(cfg.TELEGRAM_BOT_TOKEN, realChat, fileIds, {});
+    setCellIfExists_(headerMap, row, "REALISASI_LAST_SENT_AT", new Date());
+    values[idx] = row;
+    writeTable_(shWo, values);
   }
 
   appendLog_(ss, cfg.SHEET_LOG, [
@@ -1679,7 +1754,9 @@ function ensureWoDbColumns_(shWo) {
     "COORD_TG_MESSAGE_ID",
     "COORD_TG_SENT_AT",
     "COORD_TG_RESULT",
+    "COORD_MESSAGE_ID",
     "TEAM_TG_MESSAGE_ID",
+    "TEAM_MESSAGE_ID",
 
     "CalendarEventId",
     "SyncStatus",
@@ -1689,6 +1766,11 @@ function ensureWoDbColumns_(shWo) {
     "DONE_BY",
     "DONE_PHOTO_COUNT",
     "DONE_PHOTO_FILE_IDS",
+    "DONE_EVIDENCE_COUNT",
+    "REALISASI_LAST_SENT_AT",
+    "REJECT_REASON",
+    "OFFER_STATE_JSON",
+    "MANUAL_STATE_JSON",
 
     "LAST_UPDATE_AT",
     "LAST_UPDATE_BY"
